@@ -1169,9 +1169,11 @@ Função 9: void dispatch_work(int **subproblems, int count,
 └─ Usada em: main() em Rank 0
 
 Função 10: void collect_solutions(int order, int nprocs,
-                                 int **first_result)
+                                 int **solution_board)
 ├─ Tipo: Collection
-├─ Propósito: Polling para solução de workers
+├─ Propósito: Receber primeira solução de workers e armazenar
+├─ Entrada: order, nprocs, solution_board (buffer para armazenar)
+├─ Saída: solution_board preenchido com solução recebida
 ├─ Entrada: order, nprocs, resultado de Rank 0
 ├─ Saída: found_solution definido, result_board preenchido
 ├─ Lógica:
@@ -1193,14 +1195,15 @@ Função 10: void collect_solutions(int order, int nprocs,
 │
 └─ Usada em: main() em Rank 0 após solve_omp()
 
-Função 11: void worker_loop(int **first_subproblem, int order)
+Função 11: void worker_loop(int order)
 ├─ Tipo: Work Distribution
-├─ Propósito: Receber e processar subproblems
-├─ Entrada: first_subproblem (alocado em recv), order
+├─ Propósito: Receber e processar subproblems em loop
+├─ Entrada: order
 ├─ Saída: (nenhuma externa)
 ├─ Lógica:
-│  ├─ board = first_subproblem (ou recv se rank > 0)
 │  ├─ ENQUANTO TRUE:
+│  │  ├─ board = recv_subproblem(order)  // COM POLLING
+│  │  ├─ IF board == NULL: break  // Terminação recebida
 │  │  ├─ solve_omp(board, order)
 │  │  │  └─ [REUTILIZAR completamente]
 │  │  │
@@ -1222,17 +1225,17 @@ Função 11: void worker_loop(int **first_subproblem, int order)
 │
 └─ Usada em: main() em Ranks 1..N
 
-Função 12: void dispatch_work_to_self(int **first_subproblem,
+Função 12: void dispatch_work_to_self(int **rank0_board,
                                      int order, int rank)
 ├─ Tipo: Distribution
 ├─ Propósito: Rank 0 resolve seu próprio subproblem
-├─ Entrada: first_subproblem (de generate_subproblems_mpi)
+├─ Entrada: rank0_board (primeiro subproblema gerado)
 ├─ Saída: solve_omp() chamado
 ├─ Lógica:
-│  ├─ solve_omp(first_subproblem, order)
+│  ├─ solve_omp(rank0_board, order)
 │  │  └─ [REUTILIZAR]
 │  │
-│  └─ Resultado em first_subproblem
+│  └─ Resultado em rank0_board
 │
 └─ Usada em: main() em Rank 0
 ```
@@ -1264,11 +1267,11 @@ int check_termination(void);
 // Distribution & Collection
 void dispatch_work(int **subproblems, int count,
                   int order, int nprocs);
-void collect_solutions(int order, int nprocs, int **first_result);
+void collect_solutions(int order, int nprocs, int **solution_board);
 
 // Work Loop
-void worker_loop(int **first_subproblem, int order);
-void dispatch_work_to_self(int **first_subproblem, int order);
+void worker_loop(int order);
+void dispatch_work_to_self(int **rank0_board, int order);
 
 // Main entry (já existe)
 int main(int argc, char *argv[]);
@@ -1329,8 +1332,8 @@ SECÇÃO 7: Distribution & Collection
   └─ void collect_solutions(int order, int nprocs, int **first_result)
 
 SECÇÃO 8: Work Loops
-  ├─ void worker_loop(int **first_subproblem, int order)
-  └─ void dispatch_work_to_self(int **first_subproblem, int order)
+  ├─ void worker_loop(int order)
+  └─ void dispatch_work_to_self(int **rank0_board, int order)
 
 SECÇÃO 9: Main
   └─ int main(int argc, char *argv[])
@@ -1367,8 +1370,8 @@ PASSO 4: Rank 0 específico (IF rank == 0)
   │
   ├─ dispatch_work(subproblems, num_subproblems, sudoku->order, nprocs)
   │
-  ├─ first_sub = subproblems[0]
-  ├─ dispatch_work_to_self(first_sub, sudoku->order)
+  ├─ rank0_board = subproblems[0]
+  ├─ dispatch_work_to_self(rank0_board, sudoku->order)
   │  └─ ESTE CHAMA solve_omp() [REUTILIZAR]
   │
   ├─ collect_solutions(sudoku->order, nprocs, &first_sub)
