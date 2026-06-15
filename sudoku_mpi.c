@@ -68,6 +68,12 @@ int generate_subproblems_mpi(int **board, int order, int ****subproblems, int *c
 void dispatch_work(int ***subproblems, int count, int order, int nprocs);
 void dispatch_work_to_self(int **board, int order, int rank);
 
+// Worker & Solution Collection (FASE 3.5)
+void worker_loop(int order);
+void collect_solutions(int order, int nprocs, int **solution_board);
+void broadcast_termination(int nprocs);
+int check_termination(void);
+
 // Testing (FASE 3.1 - temporary)
 static int test_serialization(void);
 static int test_mpi_communication(int rank);
@@ -1139,6 +1145,190 @@ void dispatch_work_to_self(int **board, int order, int rank)
     fprintf(stderr, "[RANK 0] (solve_omp will be called in future phase)\n");
 }
 
+/**
+ * check_termination - Verifica se há mensagem de terminação (não-bloqueante)
+ * 
+ * @return: 1 se recebeu terminação, 0 caso contrário
+ * 
+ * Utiliza MPI_Iprobe() para verificar sem bloquear
+ */
+int check_termination(void)
+{
+    int flag;
+    MPI_Status status;
+    int ret;
+    
+    ret = MPI_Iprobe(0, MPI_TAG_TERMINATION, MPI_COMM_WORLD, &flag, &status);
+    if (ret != MPI_SUCCESS)
+    {
+        fprintf(stderr, "[ERROR] check_termination: MPI_Iprobe failed\n");
+        return 0;
+    }
+    
+    if (flag)
+    {
+        // Consumir mensagem de terminação
+        int dummy;
+        MPI_Recv(&dummy, 1, MPI_INT, 0, MPI_TAG_TERMINATION,
+                MPI_COMM_WORLD, &status);
+        return 1;
+    }
+    
+    return 0;
+}
+
+/**
+ * broadcast_termination - Notifica todos os workers para terminar
+ * 
+ * @nprocs: Número total de processos
+ * 
+ * Envia MPI_TAG_TERMINATION para todos os ranks > 0
+ */
+void broadcast_termination(int nprocs)
+{
+    int rank;
+    int dummy = 0;
+    int ret;
+    
+    fprintf(stderr, "[RANK 0] Broadcasting termination to all workers...\n");
+    
+    for (rank = 1; rank < nprocs; rank++)
+    {
+        ret = MPI_Send(&dummy, 1, MPI_INT, rank, MPI_TAG_TERMINATION,
+                      MPI_COMM_WORLD);
+        if (ret != MPI_SUCCESS)
+        {
+            fprintf(stderr, "[ERROR] broadcast_termination: MPI_Send to rank %d failed\n", rank);
+        }
+        else
+        {
+            fprintf(stderr, "[RANK 0] Sent termination to Rank %d\n", rank);
+        }
+    }
+}
+
+/**
+ * collect_solutions - Aguarda solução de qualquer worker
+ * 
+ * @order: Ordem do Sudoku
+ * @nprocs: Número de processos
+ * @solution_board: Buffer onde armazenar solução recebida
+ * 
+ * Utiliza MPI_Iprobe() + polling para não bloquear indefinidamente
+ * 
+ * IMPORTANTE: solution_board deve estar pré-alocado
+ */
+void collect_solutions(int order, int nprocs, int **solution_board)
+{
+    int **received_solution;
+    int size = order * order;
+    int row, col;
+    
+    (void)nprocs;  // Unused
+    
+    fprintf(stderr, "[RANK 0] Waiting for solutions from workers...\n");
+    
+    // Receber solução (recv_solution usa MPI_ANY_SOURCE)
+    received_solution = recv_solution(order);
+    
+    if (!received_solution)
+    {
+        fprintf(stderr, "[ERROR] collect_solutions: recv_solution failed\n");
+        return;
+    }
+    
+    fprintf(stderr, "[RANK 0] Solution received from a worker\n");
+    
+    // Copiar para solution_board
+    for (row = 0; row < size; row++)
+    {
+        for (col = 0; col < size; col++)
+        {
+            solution_board[row][col] = received_solution[row][col];
+        }
+    }
+    
+    // Libertar board temporário
+    free_board(received_solution, size);
+    
+    fprintf(stderr, "[RANK 0] Solution copied to solution_board\n");
+}
+
+/**
+ * worker_loop - Loop principal dos workers
+ * 
+ * @order: Ordem do Sudoku
+ * 
+ * Fluxo:
+ *   1. Receber subproblema (recv_subproblem com polling)
+ *   2. Se NULL → terminação recebida → sair
+ *   3. Resolver com solve_omp() ← REUTILIZAÇÃO
+ *   4. Se resolvido (is_solved()) ← REUTILIZAÇÃO:
+ *      - Enviar solução
+ *      - Sair
+ *   5. Senão: continuar loop
+ * 
+ * IMPORTANTE:
+ *   - NÃO cria solver novo
+ *   - REUTILIZA solve_omp() existente
+ *   - REUTILIZA is_solved() existente
+ */
+void worker_loop(int order)
+{
+    int **board;
+    int size = order * order;
+    int rank;
+    
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    
+    fprintf(stderr, "[RANK %d] Entering worker loop\n", rank);
+    
+    while (1)
+    {
+        // Passo 1: Receber subproblema (COM POLLING para terminação)
+        fprintf(stderr, "[RANK %d] Waiting for subproblem...\n", rank);
+        board = recv_subproblem(order);
+        
+        // Passo 2: Se NULL → terminação recebida
+        if (!board)
+        {
+            fprintf(stderr, "[RANK %d] Termination received, exiting loop\n", rank);
+            break;
+        }
+        
+        fprintf(stderr, "[RANK %d] Subproblem received, solving...\n", rank);
+        
+        // Passo 3: Resolver com solve_omp() ← REUTILIZAÇÃO
+        fprintf(stderr, "[RANK %d] Calling solve_omp() ← REUSE\n", rank);
+        solve_omp(board, order);
+        
+        // Passo 4: Verificar se encontrou solução com is_solved() ← REUTILIZAÇÃO
+        if (is_solved(board, order))
+        {
+            fprintf(stderr, "[RANK %d] Solution found! ✓\n", rank);
+            fprintf(stderr, "[RANK %d] Sending solution to Rank 0\n", rank);
+            
+            // Enviar solução
+            send_solution(board, order);
+            
+            // Libertar memória
+            free_board(board, size);
+            
+            fprintf(stderr, "[RANK %d] Solution sent, exiting loop\n", rank);
+            break;
+        }
+        else
+        {
+            fprintf(stderr, "[RANK %d] No solution in this subproblem\n", rank);
+            
+            // Libertar memória e continuar
+            free_board(board, size);
+        }
+    }
+    
+    fprintf(stderr, "[RANK %d] Worker loop terminated\n", rank);
+}
+
 /* ========================================================================
  * IMPLEMENTAÇÃO: TESTE MPI COMMUNICATION (FASE 3.3 - TEMPORÁRIO)
  * ======================================================================== */
@@ -1528,7 +1718,7 @@ int main(int argc, char *argv[])
     }
     
     /* ====================================================================
-     * FASE 3.4: PROCESSAMENTO DE SUDOKU - DISTRIBUIÇÃO DE TRABALHO
+     * FASE 3.5: SOLVER HÍBRIDO MPI+OPENMP COMPLETO
      * ==================================================================== */
     
     // Variáveis para distribuição MPI
@@ -1539,9 +1729,13 @@ int main(int argc, char *argv[])
     
     if (rank == 0)
     {
+        int **rank0_board = NULL;
+        int **solution_board = NULL;
+        int solution_found = 0;
+        
         fprintf(stderr, "\n");
         fprintf(stderr, "========================================\n");
-        fprintf(stderr, " PHASE 3.4: WORK DISTRIBUTION\n");
+        fprintf(stderr, " PHASE 3.5: HYBRID MPI+OpenMP SOLVER\n");
         fprintf(stderr, "========================================\n");
         fprintf(stderr, "\n");
         
@@ -1581,25 +1775,70 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[RANK 0] Dispatching work...\n");
         dispatch_work(subproblems, subproblems_count, sudoku->order, nprocs);
         
-        // Passo 5: Guardar subproblema local (destinado a Rank 0)
-        int **rank0_board = subproblems[0];  // Primeiro subproblema vai para Rank 0
-        dispatch_work_to_self(rank0_board, sudoku->order, rank);
+        // Passo 5: Resolver subproblema local (Rank 0)
+        rank0_board = subproblems[0];  // Primeiro subproblema
+        fprintf(stderr, "[RANK 0] Solving local subproblem with solve_omp() ← REUSE\n");
+        solve_omp(rank0_board, sudoku->order);
         
+        // Passo 6: Verificar se Rank 0 encontrou solução
+        if (is_solved(rank0_board, sudoku->order))
+        {
+            fprintf(stderr, "[RANK 0] Solution found locally! ✓\n");
+            solution_board = alloc_board(size);
+            if (solution_board)
+            {
+                copy_board(solution_board, rank0_board, size);
+                solution_found = 1;
+            }
+        }
+        else
+        {
+            fprintf(stderr, "[RANK 0] No solution in local subproblem\n");
+            fprintf(stderr, "[RANK 0] Waiting for solutions from workers...\n");
+            
+            // Alocar buffer para solução
+            solution_board = alloc_board(size);
+            if (!solution_board)
+            {
+                fprintf(stderr, "[ERROR] Failed to allocate solution_board\n");
+                MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+            }
+            
+            // Aguardar solução de workers
+            collect_solutions(sudoku->order, nprocs, solution_board);
+            solution_found = 1;
+        }
+        
+        // Passo 7: Enviar terminação para todos os workers
+        fprintf(stderr, "[RANK 0] Sending termination to all workers\n");
+        broadcast_termination(nprocs);
+        
+        // Passo 8: Imprimir solução
         fprintf(stderr, "\n");
         fprintf(stderr, "========================================\n");
-        fprintf(stderr, " WORK DISTRIBUTION COMPLETED ✓\n");
-        fprintf(stderr, "========================================\n");
-        fprintf(stderr, "\n");
-        fprintf(stderr, "[PHASE 3.5] Next: Implement worker_loop() and solve\n");
+        if (solution_found && solution_board)
+        {
+            fprintf(stderr, " SOLUTION FOUND ✓\n");
+            fprintf(stderr, "========================================\n");
+            fprintf(stderr, "\n");
+            print(solution_board, sudoku->order);
+        }
+        else
+        {
+            fprintf(stderr, " NO SOLUTION FOUND ✗\n");
+            fprintf(stderr, "========================================\n");
+        }
         fprintf(stderr, "\n");
         
-        // Libertar memória (sudoku e subproblemas)
+        // Libertar memória
         free_sudoku(sudoku);
         for (int i = 0; i < subproblems_count; i++)
         {
             free_board(subproblems[i], size);
         }
         free(subproblems);
+        if (solution_board)
+            free_board(solution_board, size);
     }
     else
     {
@@ -1612,11 +1851,12 @@ int main(int argc, char *argv[])
         
         fprintf(stderr, "[RANK %d] Received parameters: order=%d, count=%d\n",
                 rank, order_recv, count_recv);
-        fprintf(stderr, "[RANK %d] Ready to receive work\n", rank);
-        fprintf(stderr, "[RANK %d] (worker_loop will be implemented in next phase)\n", rank);
+        fprintf(stderr, "[RANK %d] Starting worker loop\n", rank);
         
-        // NOTA: worker_loop() será implementado em FASE 3.5
-        // Por enquanto, workers apenas recebem os parâmetros
+        // Entrar no loop de worker
+        worker_loop(order_recv);
+        
+        fprintf(stderr, "[RANK %d] Worker loop completed\n", rank);
     }
     
     /* ====================================================================
