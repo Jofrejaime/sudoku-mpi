@@ -1,79 +1,4 @@
-/* ========================================================================
- * SUDOKU MPI + OPENMP HÍBRIDO
- * 
- * Solver híbrido de Sudoku utilizando MPI para distribuição de trabalho
- * entre processos e OpenMP para paralelização local.
- * 
- * Arquitectura:
- * - MPI: Distribuição de subproblemas entre processos (Round-Robin)
- * - OpenMP: Paralelização local do solver backtracking
- * - Reutilização integral de solve_omp() e is_solved()
- * 
- * Referências:
- * - ARQUITETURA_MPI_HIBRIDO.md
- * - REVISAO_IMPLEMENTABILIDADE.md
- * ======================================================================== */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <mpi.h>
-#include <omp.h>
 #include "sudoku.h"
-#include "benchmark/benchmark.h"
-
-/* DEBUG flag (activar em compilação: -DDEBUG_MPI) */
-#ifdef DEBUG_MPI
-    #define DEBUG_LOG(rank, fmt, ...) \
-        fprintf(stderr, "[DEBUG Rank %d] " fmt "\n", rank, ##__VA_ARGS__)
-#else
-    #define DEBUG_LOG(rank, fmt, ...) /* nop */
-#endif
-
-/* ========================================================================
- * CONSTANTES MPI
- * ======================================================================== */
-
-// MPI Tags conforme arquitectura aprovada
-#define MPI_TAG_SUBPROBLEM    101
-#define MPI_TAG_SOLUTION      102
-#define MPI_TAG_TERMINATION   103
-
-// Parâmetros de geração de subproblemas
-#define SUBPROBLEM_MAX 1024
-
-// Polling interval (5ms conforme validação PASSO 1)
-#define POLL_INTERVAL 5000  // microseconds
-
-/* ========================================================================
- * PROTÓTIPOS DE FUNÇÕES
- * ======================================================================== */
-
-// Configuration
-void configure_openmp(int rank, int nprocs);
-
-// Serialization (FASE 3.1)
-void flatten_board(int **board, int size, int *buffer);
-int **unflatten_board(int *buffer, int size);
-
-// MPI Communication (FASE 3.3)
-void send_subproblem(int **board, int order, int dest_rank);
-int **recv_subproblem(int order);
-void send_solution(int **board, int order);
-int **recv_solution(int order);
-
-// Work Distribution
-int generate_subproblems_mpi(int **board, int order, int ****subproblems, int *count);
-void dispatch_work(int ***subproblems, int count, int order, int nprocs);
-
-// Worker & Solution Collection
-void worker_loop(int order);
-void collect_solutions(int order, int nprocs, int **solution_board);
-void broadcast_termination(int nprocs);
-// Utility
-static void print_usage(void);
-
-// Main entry
-int main(int argc, char *argv[]);
 
 /* ========================================================================
  * IMPLEMENTAÇÃO: CONFIGURAÇÃO OPENMP
@@ -123,9 +48,7 @@ void configure_openmp(int rank, int nprocs)
         {
             // CORRIGIDO: Aplicar explicitamente mesmo em modo manual
             omp_set_num_threads(num_threads);
-            
-            DEBUG_LOG(rank, "OpenMP: Manual mode, threads=%d", num_threads);
-            
+
             if (rank == 0)
             {
                 fprintf(stderr, "[OpenMP] Manual configuration: %d threads per process\n",
@@ -141,9 +64,7 @@ void configure_openmp(int rank, int nprocs)
         num_threads = 1;  // Mínimo 1 thread por processo
     
     omp_set_num_threads(num_threads);
-    
-    DEBUG_LOG(rank, "OpenMP: Auto mode, threads=%d", num_threads);
-    
+
     if (rank == 0)
     {
         fprintf(stderr, "[OpenMP] Auto-configured: %d threads per process "
@@ -151,10 +72,6 @@ void configure_openmp(int rank, int nprocs)
                 num_threads, available_procs, nprocs);
     }
 }
-
-/* ========================================================================
- * IMPLEMENTAÇÃO: SERIALIZAÇÃO (FASE 3.1)
- * ======================================================================== */
 
 /**
  * flatten_board - Serializa board 2D para buffer 1D
@@ -285,9 +202,6 @@ int **unflatten_board(int *buffer, int size)
     return board;
 }
 
-/* ========================================================================
- * IMPLEMENTAÇÃO: MPI COMMUNICATION LAYER
- * ======================================================================== */
 
 /**
  * send_subproblem - Envia subproblema para worker via MPI
@@ -576,10 +490,6 @@ int **recv_solution(int order)
     return board;
 }
 
-/* ========================================================================
- * IMPLEMENTAÇÃO: WORK DISTRIBUTION (FASE 3.4)
- * ======================================================================== */
-
 /**
  * find_first_empty - Encontra primeira célula vazia no board
  * 
@@ -716,8 +626,6 @@ int generate_subproblems_mpi(int **board, int order, int ****subproblems, int *c
         return -1;
     }
 
-    DEBUG_LOG(rank, "First empty cell: [%d][%d]", row, col);
-
     /* Alocar array de ponteiros para subproblemas */
     *subproblems = malloc(sizeof(int **) * size);
     if (!*subproblems)
@@ -753,8 +661,6 @@ int generate_subproblems_mpi(int **board, int order, int ****subproblems, int *c
         value++;
     }
 
-    DEBUG_LOG(0, "Generated %d subproblems", *count);
-
     return 0;
 }
 
@@ -784,9 +690,7 @@ void dispatch_work(int ***subproblems, int count, int order, int nprocs)
 {
     int i;
     int dest_rank;
-    
-    DEBUG_LOG(0, "Distributing %d subproblems across %d processes", count, nprocs);
-    
+
     // Distribuir subproblemas usando Round-Robin
     for (i = 0; i < count; i++)
     {
@@ -796,7 +700,6 @@ void dispatch_work(int ***subproblems, int count, int order, int nprocs)
         {
             // Ranks > 0: enviar via MPI
             send_subproblem(subproblems[i], order, dest_rank);
-            DEBUG_LOG(0, "Sent subproblem %d to Rank %d", i, dest_rank);
         }
     }
 }
@@ -813,8 +716,6 @@ void broadcast_termination(int nprocs)
     int rank;
     int dummy = 0;
     int ret;
-    
-    DEBUG_LOG(0, "Broadcasting termination to %d workers", nprocs - 1);
     
     for (rank = 1; rank < nprocs; rank++)
     {
@@ -845,8 +746,6 @@ void collect_solutions(int order, int nprocs, int **solution_board)
     int row, col;
     
     (void)nprocs;
-    
-    DEBUG_LOG(0, "Waiting for solution from workers");
     
     received_solution = recv_solution(order);
     
@@ -894,9 +793,6 @@ void worker_loop(int order)
     int rank;
     
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    
-    DEBUG_LOG(rank, "Entering worker loop");
-    
     while (1)
     {
         // Receber subproblema (COM POLLING para terminação)
@@ -904,12 +800,7 @@ void worker_loop(int order)
         
         // Se NULL → terminação recebida
         if (!board)
-        {
-            DEBUG_LOG(rank, "Termination received");
             break;
-        }
-        
-        DEBUG_LOG(rank, "Solving subproblem with solve_omp()");
         solve_omp(board, order);
         
         // Verificar se encontrou solução
@@ -921,13 +812,8 @@ void worker_loop(int order)
             break;
         }
         else
-        {
-            DEBUG_LOG(rank, "No solution in this subproblem");
             free_board(board, size);
-        }
     }
-    
-    DEBUG_LOG(rank, "Worker loop terminated");
 }
 
 /* ========================================================================
@@ -977,8 +863,6 @@ int main(int argc, char *argv[])
     
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
-    
-    DEBUG_LOG(rank, "Started (processes: %d)", nprocs);
     
     configure_openmp(rank, nprocs);
     
@@ -1033,8 +917,6 @@ int main(int argc, char *argv[])
         }
         
         size = sudoku->order * sudoku->order;
-        DEBUG_LOG(0, "Loaded Sudoku: order=%d, size=%d×%d", 
-                  sudoku->order, size, size);
         
         // Gerar subproblemas
         int ret = generate_subproblems_mpi(sudoku->tab, sudoku->order,
@@ -1049,15 +931,12 @@ int main(int argc, char *argv[])
         // Broadcast parâmetros para todos os ranks
         MPI_Bcast(&sudoku->order, 1, MPI_INT, 0, MPI_COMM_WORLD);
         MPI_Bcast(&subproblems_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        DEBUG_LOG(0, "Broadcast parameters: order=%d, subproblems=%d",
-                  sudoku->order, subproblems_count);
         
         // Distribuir trabalho (Round-Robin)
         dispatch_work(subproblems, subproblems_count, sudoku->order, nprocs);
         
         // Resolver subproblema local (Rank 0)
         rank0_board = subproblems[0];
-        DEBUG_LOG(0, "Solving local subproblem with solve_omp()");
         solve_omp(rank0_board, sudoku->order);
         
         // Verificar se Rank 0 encontrou solução
@@ -1073,8 +952,6 @@ int main(int argc, char *argv[])
         }
         else
         {
-            DEBUG_LOG(0, "No solution locally, waiting for workers");
-            
             solution_board = alloc_board(size);
             if (!solution_board)
             {
@@ -1097,9 +974,6 @@ int main(int argc, char *argv[])
         
         MPI_Bcast(&order_recv, 1, MPI_INT, 0, MPI_COMM_WORLD);
         MPI_Bcast(&count_recv, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        
-        DEBUG_LOG(rank, "Received parameters: order=%d", order_recv);
-        
         worker_loop(order_recv);
     }
     
@@ -1148,9 +1022,6 @@ int main(int argc, char *argv[])
             free_board(solution_board, size);
         benchmark_free(bench);
     }
-    
-    DEBUG_LOG(rank, "Finalizing MPI");
     MPI_Finalize();
-    
     return 0;
 }
