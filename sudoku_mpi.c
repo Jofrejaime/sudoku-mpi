@@ -19,6 +19,7 @@
 #include <mpi.h>
 #include <omp.h>
 #include "sudoku.h"
+#include "benchmark/benchmark.h"
 
 /* DEBUG flag (activar em compilação: -DDEBUG_MPI) */
 #ifdef DEBUG_MPI
@@ -643,6 +644,60 @@ static int find_first_empty(int **board, int size, int *row, int *col)
  *   - Aloca cada subproblema com alloc_board()
  *   - Caller deve libertar com free_board() para cada subproblema
  */
+/**
+ * is_valid_placement - Verifica se 'value' pode ser colocado em board[row][col]
+ *
+ * Verifica conflitos em linha, coluna e bloco order×order.
+ * Evita gerar subproblemas impossíveis que causam "Invalid initial board"
+ * ou "Nenhuma solução" nos workers.
+ *
+ * @return: 1 se válido, 0 se conflito
+ */
+static int is_valid_placement(int **board, int size, int order, int row, int col, int value)
+{
+    int i;
+    int box_row;
+    int box_col;
+    int r;
+    int c;
+
+    /* Verificar linha */
+    i = 0;
+    while (i < size)
+    {
+        if (board[row][i] == value)
+            return 0;
+        i++;
+    }
+
+    /* Verificar coluna */
+    i = 0;
+    while (i < size)
+    {
+        if (board[i][col] == value)
+            return 0;
+        i++;
+    }
+
+    /* Verificar bloco order×order */
+    box_row = (row / order) * order;
+    box_col = (col / order) * order;
+    r = box_row;
+    while (r < box_row + order)
+    {
+        c = box_col;
+        while (c < box_col + order)
+        {
+            if (board[r][c] == value)
+                return 0;
+            c++;
+        }
+        r++;
+    }
+
+    return 1;
+}
+
 int generate_subproblems_mpi(int **board, int order, int ****subproblems, int *count)
 {
     int size;
@@ -650,58 +705,56 @@ int generate_subproblems_mpi(int **board, int order, int ****subproblems, int *c
     int value;
     int i;
     int **sub;
-    
+
     size = order * order;
     *count = 0;
-    
-    // Encontrar primeira célula vazia
+
+    /* Encontrar primeira célula vazia */
     if (!find_first_empty(board, size, &row, &col))
     {
         fprintf(stderr, "[ERROR] generate_subproblems: no empty cells\n");
         return -1;
     }
-    
+
     DEBUG_LOG(rank, "First empty cell: [%d][%d]", row, col);
-    
-    // Alocar array de ponteiros para subproblemas
+
+    /* Alocar array de ponteiros para subproblemas */
     *subproblems = malloc(sizeof(int **) * size);
     if (!*subproblems)
     {
         fprintf(stderr, "[ERROR] generate_subproblems: malloc failed\n");
         return -1;
     }
-    
-    // Gerar subproblema para cada valor possível
+
+    /* Gerar subproblema apenas para valores sem conflito imediato.
+     * Valores inválidos causariam "Invalid initial board" ou "Nenhuma solução"
+     * nos workers, poluindo o output e desperdiçando trabalho. */
     value = 1;
     while (value <= size && *count < SUBPROBLEM_MAX)
     {
-        // Alocar subproblema
-        sub = alloc_board(size);
-        if (!sub)
+        if (is_valid_placement(board, size, order, row, col, value))
         {
-            fprintf(stderr, "[ERROR] generate_subproblems: alloc_board failed\n");
-            // Libertar subproblemas já alocados
-            for (i = 0; i < *count; i++)
-                free_board((*subproblems)[i], size);
-            free(*subproblems);
-            return -1;
+            sub = alloc_board(size);
+            if (!sub)
+            {
+                fprintf(stderr, "[ERROR] generate_subproblems: alloc_board failed\n");
+                for (i = 0; i < *count; i++)
+                    free_board((*subproblems)[i], size);
+                free(*subproblems);
+                return -1;
+            }
+
+            copy_board(sub, board, size);
+            sub[row][col] = value;
+
+            (*subproblems)[*count] = sub;
+            (*count)++;
         }
-        
-        // Copiar board original
-        copy_board(sub, board, size);
-        
-        // Fixar célula vazia com valor
-        sub[row][col] = value;
-        
-        // Adicionar aos subproblemas
-        (*subproblems)[*count] = sub;
-        (*count)++;
-        
         value++;
     }
-    
+
     DEBUG_LOG(0, "Generated %d subproblems", *count);
-    
+
     return 0;
 }
 
@@ -761,7 +814,7 @@ void broadcast_termination(int nprocs)
     int dummy = 0;
     int ret;
     
-    fprintf(stderr, "[RANK 0] Broadcasting termination to all workers...\n");
+    DEBUG_LOG(0, "Broadcasting termination to %d workers", nprocs - 1);
     
     for (rank = 1; rank < nprocs; rank++)
     {
@@ -770,10 +823,6 @@ void broadcast_termination(int nprocs)
         if (ret != MPI_SUCCESS)
         {
             fprintf(stderr, "[ERROR] broadcast_termination: MPI_Send to rank %d failed\n", rank);
-        }
-        else
-        {
-            fprintf(stderr, "[RANK 0] Sent termination to Rank %d\n", rank);
         }
     }
 }
@@ -795,11 +844,10 @@ void collect_solutions(int order, int nprocs, int **solution_board)
     int size = order * order;
     int row, col;
     
-    (void)nprocs;  // Unused
+    (void)nprocs;
     
-    fprintf(stderr, "[RANK 0] Waiting for solutions from workers...\n");
+    DEBUG_LOG(0, "Waiting for solution from workers");
     
-    // Receber solução (recv_solution usa MPI_ANY_SOURCE)
     received_solution = recv_solution(order);
     
     if (!received_solution)
@@ -807,8 +855,6 @@ void collect_solutions(int order, int nprocs, int **solution_board)
         fprintf(stderr, "[ERROR] collect_solutions: recv_solution failed\n");
         return;
     }
-    
-    fprintf(stderr, "[RANK 0] Solution received from a worker\n");
     
     // Copiar para solution_board
     for (row = 0; row < size; row++)
@@ -819,10 +865,7 @@ void collect_solutions(int order, int nprocs, int **solution_board)
         }
     }
     
-    // Libertar board temporário
     free_board(received_solution, size);
-    
-    fprintf(stderr, "[RANK 0] Solution copied to solution_board\n");
 }
 
 /**
@@ -909,53 +952,35 @@ static void print_usage(void)
 
 /**
  * main - Entry point do programa híbrido MPI + OpenMP
- * - Resolução com solve_omp()
- * - Recolha de solução
+ * 
+ * Fluxo:
+ *   Rank 0: Carrega Sudoku, gera subproblemas, distribui trabalho,
+ *           resolve localmente, recolhe solução, envia terminação
+ *   Workers: Recebem subproblemas, resolvem com solve_omp(),
+ *            enviam solução se encontrada
  */
 int main(int argc, char *argv[])
 {
     int rank, nprocs;
     int provided;
     
-    /* ====================================================================
-     * FASE 2.2: MPI INIT COM THREAD SUPPORT
-     * ==================================================================== */
-    
-    // Inicializar MPI com suporte para threads
-    // MPI_THREAD_SERIALIZED: Apenas uma thread por vez pode chamar MPI
-    // (Suficiente porque apenas main thread chama MPI, OpenMP threads
-    //  nunca chamam funções MPI)
+    // Inicializar MPI com suporte para threads (MPI_THREAD_SERIALIZED)
     MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
     
-    // Validar nível de thread support obtido
     if (provided < MPI_THREAD_SERIALIZED)
     {
-        fprintf(stderr, "[MPI ERROR] Insufficient thread support\n");
-        fprintf(stderr, "  Required: MPI_THREAD_SERIALIZED\n");
-        fprintf(stderr, "  Provided: %d\n", provided);
-        fprintf(stderr, "  Cannot proceed with hybrid MPI+OpenMP\n");
+        fprintf(stderr, "[ERROR] Insufficient MPI thread support\n");
+        fprintf(stderr, "  Required: MPI_THREAD_SERIALIZED, Provided: %d\n", provided);
         MPI_Finalize();
         return 1;
     }
     
-    /* ====================================================================
-     * FASE 2.3: OBTER RANK E NPROCS
-     * ==================================================================== */
-    
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
     
-    DEBUG_LOG(rank, "Started (total processes: %d)", nprocs);
-    
-    /* ====================================================================
-     * FASE 2.4: CONFIGURAÇÃO OPENMP
-     * ==================================================================== */
+    DEBUG_LOG(rank, "Started (processes: %d)", nprocs);
     
     configure_openmp(rank, nprocs);
-    
-    /* ====================================================================
-     * FASE 2.6: VALIDAÇÃO DE INFRAESTRUTURA
-     * ==================================================================== */
     
     // Validar argumentos
     if (argc < 2)
@@ -969,41 +994,49 @@ int main(int argc, char *argv[])
         return 1;
     }
     
-    /* ====================================================================
-     * SOLVER HÍBRIDO MPI+OPENMP
-     * ==================================================================== */
-    
     // Variáveis para distribuição MPI
     t_sudoku *sudoku = NULL;
     int ***subproblems = NULL;
     int subproblems_count = 0;
     int size = 0;
+    t_benchmark *bench = NULL;
+    int **rank0_board = NULL;
+    int **solution_board = NULL;
+    int solution_found = 0;
+    
+    // Inicializar benchmark (todos os ranks)
+    if (rank == 0)
+    {
+        bench = benchmark_init(nprocs, omp_get_max_threads());
+        if (!bench)
+        {
+            fprintf(stderr, "[ERROR] Failed to initialize benchmark\n");
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        }
+    }
+    
+    // Sincronizar todos antes de iniciar medição
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    // Iniciar medição (apenas Rank 0 registra)
+    if (rank == 0)
+        benchmark_start(bench);
     
     if (rank == 0)
     {
-        int **rank0_board = NULL;
-        int **solution_board = NULL;
-        int solution_found = 0;
-        fprintf(stderr, " PHASE 3.5: HYBRID MPI+OpenMP SOLVER\n");
-        fprintf(stderr, "========================================\n");
-        fprintf(stderr, "\n");
-        
-        // Passo 1: Carregar Sudoku
-        fprintf(stderr, "[RANK 0] Loading Sudoku from: %s\n", argv[1]);
+        // Carregar Sudoku
         sudoku = load_sudoku(argv[1]);
         if (!sudoku)
         {
-            fprintf(stderr, "[ERROR] Failed to load Sudoku\n");
+            fprintf(stderr, "[ERROR] Failed to load Sudoku from: %s\n", argv[1]);
             MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
-        fprintf(stderr, "[RANK 0] Sudoku loaded: order=%d, size=%d×%d\n",
-                sudoku->order, sudoku->order * sudoku->order,
-                sudoku->order * sudoku->order);
         
         size = sudoku->order * sudoku->order;
+        DEBUG_LOG(0, "Loaded Sudoku: order=%d, size=%d×%d", 
+                  sudoku->order, size, size);
         
-        // Passo 2: Gerar subproblemas
-        fprintf(stderr, "[RANK 0] Generating subproblems...\n");
+        // Gerar subproblemas
         int ret = generate_subproblems_mpi(sudoku->tab, sudoku->order,
                                           &subproblems, &subproblems_count);
         if (ret != 0 || subproblems_count == 0)
@@ -1013,26 +1046,24 @@ int main(int argc, char *argv[])
             MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
         
-        // Passo 3: Broadcast parâmetros para todos os ranks
-        fprintf(stderr, "[RANK 0] Broadcasting parameters...\n");
+        // Broadcast parâmetros para todos os ranks
         MPI_Bcast(&sudoku->order, 1, MPI_INT, 0, MPI_COMM_WORLD);
         MPI_Bcast(&subproblems_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        fprintf(stderr, "[RANK 0] Broadcast: order=%d, count=%d\n",
-                sudoku->order, subproblems_count);
+        DEBUG_LOG(0, "Broadcast parameters: order=%d, subproblems=%d",
+                  sudoku->order, subproblems_count);
         
-        // Passo 4: Distribuir trabalho (Round-Robin)
-        fprintf(stderr, "[RANK 0] Dispatching work...\n");
+        // Distribuir trabalho (Round-Robin)
         dispatch_work(subproblems, subproblems_count, sudoku->order, nprocs);
         
-        // Passo 5: Resolver subproblema local (Rank 0)
-        rank0_board = subproblems[0];  // Primeiro subproblema
-        fprintf(stderr, "[RANK 0] Solving local subproblem with solve_omp() ← REUSE\n");
+        // Resolver subproblema local (Rank 0)
+        rank0_board = subproblems[0];
+        DEBUG_LOG(0, "Solving local subproblem with solve_omp()");
         solve_omp(rank0_board, sudoku->order);
         
-        // Passo 6: Verificar se Rank 0 encontrou solução
+        // Verificar se Rank 0 encontrou solução
         if (is_solved(rank0_board, sudoku->order))
         {
-            fprintf(stderr, "[RANK 0] Solution found locally! ✓\n");
+            fprintf(stderr, "[RANK 0] Solution found locally\n");
             solution_board = alloc_board(size);
             if (solution_board)
             {
@@ -1042,10 +1073,8 @@ int main(int argc, char *argv[])
         }
         else
         {
-            fprintf(stderr, "[RANK 0] No solution in local subproblem\n");
-            fprintf(stderr, "[RANK 0] Waiting for solutions from workers...\n");
+            DEBUG_LOG(0, "No solution locally, waiting for workers");
             
-            // Alocar buffer para solução
             solution_board = alloc_board(size);
             if (!solution_board)
             {
@@ -1053,31 +1082,60 @@ int main(int argc, char *argv[])
                 MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
             }
             
-            // Aguardar solução de workers
             collect_solutions(sudoku->order, nprocs, solution_board);
             solution_found = 1;
         }
         
-        // Passo 7: Enviar terminação para todos os workers
-        fprintf(stderr, "[RANK 0] Sending termination to all workers\n");
+        // Enviar terminação para todos os workers
         broadcast_termination(nprocs);
+    }
+    else
+    {
+        // Workers: Receber parâmetros e entrar no loop
+        int order_recv;
+        int count_recv;
         
-        // Passo 8: Imprimir solução
+        MPI_Bcast(&order_recv, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&count_recv, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        
+        DEBUG_LOG(rank, "Received parameters: order=%d", order_recv);
+        
+        worker_loop(order_recv);
+    }
+    
+    // Sincronizar todos após terminação
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    // Parar medição (apenas Rank 0 tem bench)
+    if (rank == 0)
+        benchmark_stop(bench);
+    
+    // Calcular métricas — operação colectiva: TODOS os ranks participam.
+    // Workers passam bench = NULL; contribuem com local_elapsed = 0.0
+    // para o MPI_Reduce e retornam imediatamente.
+    benchmark_compute_metrics(bench);
+    
+    // Relatório, CSV e cleanup (apenas Rank 0)
+    if (rank == 0)
+    {
+        // Imprimir relatório
+        benchmark_print_report(bench, rank);
+        
+        // Salvar CSV
+        benchmark_save_csv(bench, rank, "benchmark_results.csv");
+        
+        // Imprimir solução
         fprintf(stderr, "\n");
-        fprintf(stderr, "========================================\n");
         if (solution_found && solution_board)
         {
-            fprintf(stderr, " SOLUTION FOUND ✓\n");
+            fprintf(stderr, "SOLUTION FOUND\n");
             fprintf(stderr, "========================================\n");
-            fprintf(stderr, "\n");
             print(solution_board, sudoku->order);
         }
         else
         {
-            fprintf(stderr, " NO SOLUTION FOUND ✗\n");
-            fprintf(stderr, "========================================\n");
+            fprintf(stderr, "NO SOLUTION FOUND\n");
         }
-        fprintf(stderr, "\n");
         
         // Libertar memória
         free_sudoku(sudoku);
@@ -1088,40 +1146,10 @@ int main(int argc, char *argv[])
         free(subproblems);
         if (solution_board)
             free_board(solution_board, size);
+        benchmark_free(bench);
     }
-    else
-    {
-        // Workers: Receber parâmetros broadcast
-        int order_recv;
-        int count_recv;
-        
-        MPI_Bcast(&order_recv, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&count_recv, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        
-        fprintf(stderr, "[RANK %d] Received parameters: order=%d, count=%d\n",
-                rank, order_recv, count_recv);
-        fprintf(stderr, "[RANK %d] Starting worker loop\n", rank);
-        
-        // Entrar no loop de worker
-        worker_loop(order_recv);
-        
-        fprintf(stderr, "[RANK %d] Worker loop completed\n", rank);
-    }
-    
-    /* ====================================================================
-     * FINALIZAÇÃO MPI
-     * 
-     * JUSTIFICAÇÃO: MPI_Barrier() REMOVIDO
-     * 
-     * MPI_Finalize() implicitamente sincroniza todos os processos antes
-     * de terminar. MPI_Barrier() explícito é redundante neste contexto.
-     * 
-     * Apenas seria necessário se houvesse operações após barreira mas
-     * antes de Finalize (não é o caso).
-     * ==================================================================== */
     
     DEBUG_LOG(rank, "Finalizing MPI");
-    
     MPI_Finalize();
     
     return 0;

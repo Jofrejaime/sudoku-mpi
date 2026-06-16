@@ -41,7 +41,7 @@ $(OMP_NAME): $(OBJ_DIR)/sudoku_omp.o $(OBJ_DIR)/backtracking_omp.o $(OBJ_DIR)/ge
 	$(CC) $(CFLAGS_OPT) $^ -o $@
 	@echo "✓ OMP version: $(OMP_NAME)"
 
-$(MPI_NAME): $(OBJ_DIR)/sudoku_mpi.o $(OBJ_DIR)/backtracking_omp.o $(OBJ_DIR)/get_next_line_mpi.o $(OBJ_DIR)/utils_mpi.o $(OBJ_DIR)/parser_mpi.o $(OBJ_DIR)/loader_mpi.o
+$(MPI_NAME): $(OBJ_DIR)/sudoku_mpi.o $(OBJ_DIR)/benchmark.o $(OBJ_DIR)/backtracking_omp.o $(OBJ_DIR)/get_next_line_mpi.o $(OBJ_DIR)/utils_mpi.o $(OBJ_DIR)/parser_mpi.o $(OBJ_DIR)/loader_mpi.o
 	$(MPICC) $(CFLAGS_OPT) $^ -o $@
 	@echo "✓ MPI version: $(MPI_NAME)"
 
@@ -122,6 +122,14 @@ $(OBJ_DIR)/parser_mpi.o: validator/parser.c
 	$(MPICC) $(CFLAGS_OPT) -c $< -o $@
 
 $(OBJ_DIR)/loader_mpi.o: validator/loader.c
+	@mkdir -p $(OBJ_DIR)
+	$(MPICC) $(CFLAGS_OPT) -c $< -o $@
+
+# ============================================
+# BENCHMARK COMPILATION
+# ============================================
+
+$(OBJ_DIR)/benchmark.o: benchmark/benchmark.c benchmark/benchmark.h
 	@mkdir -p $(OBJ_DIR)
 	$(MPICC) $(CFLAGS_OPT) -c $< -o $@
 
