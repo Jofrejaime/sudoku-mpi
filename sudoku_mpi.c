@@ -1,5 +1,6 @@
 #include "sudoku.h"
-
+#include "benchmark/benchmark.h"
+#include <mpi.h>
 /* ========================================================================
  * IMPLEMENTAÇÃO: CONFIGURAÇÃO OPENMP
  * ======================================================================== */
@@ -635,7 +636,7 @@ int generate_subproblems_mpi(int **board, int order, int ****subproblems, int *c
     }
 
     /* Gerar subproblema apenas para valores sem conflito imediato.
-     * Valores inválidos causariam "Invalid initial board" ou "Nenhuma solução"
+     * Valores inválidos causari am "Invalid initial board" ou "Nenhuma solução"
      * nos workers, poluindo o output e desperdiçando trabalho. */
     value = 1;
     while (value <= size && *count < SUBPROBLEM_MAX)
@@ -962,7 +963,7 @@ int main(int argc, char *argv[])
             collect_solutions(sudoku->order, nprocs, solution_board);
             solution_found = 1;
         }
-        
+                                                       
         // Enviar terminação para todos os workers
         broadcast_termination(nprocs);
     }

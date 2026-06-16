@@ -11,10 +11,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <mpi.h>
 #include <omp.h>
-#include "sudoku.h"
-#include "benchmark/benchmark.h"
 
 
 
@@ -80,10 +77,5 @@ void dispatch_work(int ***subproblems, int count, int order, int nprocs);
 void worker_loop(int order);
 void collect_solutions(int order, int nprocs, int **solution_board);
 void broadcast_termination(int nprocs);
-// Utility
-static void print_usage(void);
-
-// Main entry
-int main(int argc, char *argv[]);
 
 #endif
